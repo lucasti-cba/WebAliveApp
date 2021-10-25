@@ -1,0 +1,110 @@
+name: Build and deploy Docker app to Azure
+on:
+  push:
+    branches:
+      - master
+
+env:
+  APPNAME: WebAliveApp
+  APPLICATIONPATH: Application
+  HOSTINGPLAN: WebAliveApp
+  PYTHON_VERSION: '3.7.5'                       # set this to the python version to use
+  DOCKERFILEPATH: "Application"
+  REGISTRYSKU: "Standard"
+  REGISTRYNAME: "webaliveappacr"
+  REGISTRYLOCATION: "South Central US"
+  IMAGENAME: "webaliveapp2211"
+  RESOURCEGROUPNAME: WebAliveApp-rg
+  LOCATION: South Central US
+  APPINSIGHTSLOCATION: South Central US
+  SUBSCRIPTIONID: dcb4fbb4-3f6b-4402-8a54-5e88ee450c69
+  SKU: S1 Standard
+
+jobs:
+  build:
+    name: Build and push Application to ACR
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: Azure authentication
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create ACR
+      id: createACR
+      run: |
+          az acr create -n ${{ env.REGISTRYNAME }} -g ${{ env.RESOURCEGROUPNAME }} --location "${{env.REGISTRYLOCATION}}" --sku ${{env.REGISTRYSKU}} --admin-enabled
+          echo "::set-output name=acr_username::`az acr credential show -n ${{ env.REGISTRYNAME }} --query username`"
+          echo "::set-output name=acr_password::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value`"
+          echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value`"
+
+    - name: ACR authentication
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.REGISTRYNAME }}.azurecr.io
+        username: ${{ steps.createACR.outputs.acr_username }}
+        password: ${{ steps.createACR.outputs.acr_password }}
+
+    - name: Use Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install Dependencies
+      continue-on-error: false
+      run: |
+        pip install -r Application/requirements.txt
+
+    - name: Pytest
+      continue-on-error: false
+      run: |
+        mkdir testresults
+        pip install pytest && pytest Tests/unit_tests --junitxml=./testresults/test-results.xml && pip install pycmd && py.cleanup Tests/
+
+    # Uploading unit test results to artifact store
+    - name: Upload unit test results to Artifact
+      continue-on-error: false
+      uses: actions/upload-artifact@v2
+      with:
+        name: UnitTestResults
+        path: ./testresults/test-results.xml
+
+    - name: Docker Build & Push to ACR
+      run: |
+        docker login ${{ env.REGISTRYNAME }}.azurecr.io --username ${{ steps.createACR.outputs.acr_username }} --password ${{ steps.createACR.outputs.acr_password }}
+        docker build "$GITHUB_WORKSPACE/${{env.DOCKERFILEPATH}}" -f  "${{env.DOCKERFILEPATH}}/Dockerfile" -t ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy application to AKS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+
+    - name: Azure authentication
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - uses: azure/arm-deploy@v1
+      id: deploy
+      with:
+        subscriptionId: ${{ env.SUBSCRIPTIONID }}
+        resourceGroupName: ${{ env.RESOURCEGROUPNAME }}
+        template: ./ArmTemplates/container-webapp-template.json
+        parameters: webAppName="${{ env.APPNAME }}" hostingPlanName="${{ env.HOSTINGPLAN }}" sku="${{ env.SKU }}" appInsightsLocation="${{ env.APPINSIGHTSLOCATION }}" registryName="${{ env.REGISTRYNAME }}" imageName="${{ env.IMAGENAME }}" registryLocation="${{ env.REGISTRYLOCATION }}" registrySku="${{ env.REGISTRYSKU }}"
+
+    - name: Get ACR credentials
+      id: getACRCred
+      run: |
+           echo "::set-output name=acr_username::`az acr credential show -n ${{ env.REGISTRYNAME }} --query username | xargs`"
+           echo "::set-output name=acr_password::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`"
+           echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`"
+
+    - name: 'Deploy to Azure Web App for Container'
+      uses: azure/webapps-deploy@v2
+      with: 
+        app-name: ${{ env.APPNAME }} 
+        images: ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
